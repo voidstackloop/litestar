@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from litestar import Request, asgi, get, post
+from litestar import Litestar, Request, asgi, get, post
 from litestar.connection.base import AuthT, StateT, UserT, empty_send
 from litestar.datastructures import Address, Cookie, State
 from litestar.exceptions import (
@@ -395,6 +395,31 @@ def test_request_cookies() -> None:
         assert response.text == "Hello, world!"
         response = client.get("/")
         assert response.text == "Hello, cookies!"
+
+
+def test_request_multiple_cookie_headers() -> None:
+    @get("/")
+    def handler(request: Request) -> dict[str, str]:
+        return request.cookies
+
+    app = Litestar(route_handlers=[handler])
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/",
+        "raw_path": b"/",
+        "root_path": "",
+        "scheme": "http",
+        "query_string": b"",
+        "headers": [
+            (b"cookie", b"a=1"),
+            (b"cookie", b"b=2; c=3"),
+            (b"cookie", b"d=4"),
+        ],
+        "app": app,
+    }
+    req = Request(scope)
+    assert req.cookies == {"a": "1", "b": "2", "c": "3", "d": "4"}
 
 
 def test_chunked_encoding() -> None:

@@ -165,3 +165,102 @@ def test_max_age_validation(
             ServerSideSessionConfig(key="a", max_age=max_age)
     else:
         ServerSideSessionConfig(key="a", max_age=max_age)
+
+
+async def test_unauthenticated_request_does_not_persist_empty_session_or_set_cookie(memory_store: MemoryStore) -> None:
+    @get("/public")
+    def handler(request: Request) -> dict[str, str]:
+        return {"status": "ok"}
+
+    app = Litestar([handler], middleware=[ServerSideSessionConfig().middleware], stores={"sessions": memory_store})
+
+    with TestClient(app) as client:
+        res = client.get("/public")
+        assert res.status_code == 200
+        assert "session" not in res.cookies
+        assert "set-cookie" not in res.headers
+        assert len(memory_store._store) == 0
+
+
+async def test_session_clear_expires_cookie_without_max_age_conflict(memory_store: MemoryStore) -> None:
+    @get("/login")
+    def login_handler(request: Request) -> None:
+        request.set_session({"user_id": "123"})
+
+    @get("/logout")
+    def logout_handler(request: Request) -> None:
+        request.clear_session()
+
+    app = Litestar(
+        [login_handler, logout_handler],
+        middleware=[ServerSideSessionConfig().middleware],
+        stores={"sessions": memory_store},
+    )
+
+    with TestClient(app) as client:
+        res_login = client.get("/login")
+        session_id = res_login.cookies.get("session")
+        assert session_id is not None
+        assert await memory_store.exists(session_id)
+
+        res_logout = client.get("/logout")
+        assert not await memory_store.exists(session_id)
+
+        set_cookie = res_logout.headers.get("set-cookie", "")
+        assert "session=null" in set_cookie
+        assert "expires=" in set_cookie.lower()
+        assert "max-age" not in set_cookie.lower()
+        assert "session" not in client.cookies
+
+
+async def test_session_empty_dict_clears_existing_session(memory_store: MemoryStore) -> None:
+    @get("/login")
+    def login_handler(request: Request) -> None:
+        request.set_session({"user_id": "123"})
+
+    @get("/empty")
+    def empty_handler(request: Request) -> None:
+        request.set_session({})
+
+    app = Litestar(
+        [login_handler, empty_handler],
+        middleware=[ServerSideSessionConfig().middleware],
+        stores={"sessions": memory_store},
+    )
+
+    with TestClient(app) as client:
+        res_login = client.get("/login")
+        session_id = res_login.cookies.get("session")
+        assert session_id is not None
+        assert await memory_store.exists(session_id)
+
+        res_empty = client.get("/empty")
+        assert not await memory_store.exists(session_id)
+        set_cookie = res_empty.headers.get("set-cookie", "")
+        assert "session=null" in set_cookie
+        assert "expires=" in set_cookie.lower()
+        assert "max-age" not in set_cookie.lower()
+        assert "session" not in client.cookies
+
+
+async def test_load_from_connection_skips_null_cookie(
+    server_side_session_backend: "ServerSideSessionBackend",
+    memory_store: MemoryStore,
+) -> None:
+    from litestar.connection import ASGIConnection
+
+    app = Litestar([], stores={"sessions": memory_store})
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/",
+        "raw_path": b"/",
+        "root_path": "",
+        "scheme": "http",
+        "query_string": b"",
+        "headers": [(b"cookie", b"session=null")],
+        "app": app,
+    }
+    connection = ASGIConnection(scope)
+    session_data = await server_side_session_backend.load_from_connection(connection)
+    assert session_data == {}

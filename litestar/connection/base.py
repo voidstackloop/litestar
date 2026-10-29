@@ -205,8 +205,9 @@ class ASGIConnection(Generic[HandlerT, UserT, AuthT, StateT]):
             if (cookies := self._connection_state.cookies) is not Empty:
                 self._cookies = cookies
             else:
+                cookie_headers = self.headers.getall("cookie", [])
                 self._connection_state.cookies = self._cookies = (
-                    parse_cookie_string(cookie_header) if (cookie_header := self.headers.get("cookie")) else {}
+                    parse_cookie_string("; ".join(cookie_headers)) if cookie_headers else {}
                 )
         return self._cookies
 

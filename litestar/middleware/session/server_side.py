@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import secrets
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from dataclasses import dataclass, field, fields
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 from litestar.datastructures import Cookie, MutableScopeHeaders
 from litestar.enums import ScopeType
@@ -15,9 +15,14 @@ __all__ = ("ServerSideSessionBackend", "ServerSideSessionConfig")
 
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from litestar import Litestar
     from litestar.connection import ASGIConnection
     from litestar.stores.base import Store
+
+SET_COOKIE_INCLUDE = {f.name for f in fields(Cookie) if f.name not in {"key", "secret"}}
+CLEAR_COOKIE_INCLUDE = {f.name for f in fields(Cookie) if f.name not in {"key", "secret", "max_age"}}
 
 
 class ServerSideSessionBackend(BaseSessionBackend["ServerSideSessionConfig"]):
@@ -27,6 +32,8 @@ class ServerSideSessionBackend(BaseSessionBackend["ServerSideSessionConfig"]):
     implement to facilitate the storage of session data.
     """
 
+    __slots__ = ("_clear_cookie_params", "_set_cookie_params")
+
     def __init__(self, config: ServerSideSessionConfig) -> None:
         """Initialize ``ServerSideSessionBackend``
 
@@ -34,6 +41,12 @@ class ServerSideSessionBackend(BaseSessionBackend["ServerSideSessionConfig"]):
             config: A subclass of ``ServerSideSessionConfig``
         """
         super().__init__(config=config)
+        self._set_cookie_params: Final[Mapping[str, Any]] = dict(
+            extract_dataclass_items(config, exclude_none=True, include=SET_COOKIE_INCLUDE)
+        )
+        self._clear_cookie_params: Final[Mapping[str, Any]] = dict(
+            extract_dataclass_items(config, exclude_none=True, include=CLEAR_COOKIE_INCLUDE)
+        )
 
     async def get(self, session_id: str, store: Store) -> bytes | None:
         """Retrieve data associated with ``session_id``.
@@ -109,9 +122,9 @@ class ServerSideSessionBackend(BaseSessionBackend["ServerSideSessionConfig"]):
     async def store_in_message(self, scope_session: ScopeSession, message: Message, connection: ASGIConnection) -> None:
         """Store the necessary information in the outgoing ``Message`` by setting a cookie containing the session-ID.
 
-        If the session is empty, a null-cookie will be set. Otherwise, the serialised
-        data will be stored using :meth:`set <ServerSideSessionBackend.set>`, under the current session-id. If no session-ID
-        exists, a new ID will be generated using :meth:`generate_session_id <ServerSideSessionBackend.generate_session_id>`.
+        If the session has data, the serialized data will be stored using :meth:`set <ServerSideSessionBackend.set>`,
+        under the session-id. If the session was cleared or emptied, any existing session will be deleted from the store
+        and expired on the client. If no session was provided and none was set, no action is taken.
 
         Args:
             scope_session: Current session to store
@@ -124,21 +137,21 @@ class ServerSideSessionBackend(BaseSessionBackend["ServerSideSessionConfig"]):
         scope = connection.scope
         store = self.config.get_store_from_app(scope["app"])
         headers = MutableScopeHeaders.from_message(message)
-        session_id = self.get_session_id(connection)
+        incoming_session_id = connection.cookies.get(self.config.key)
 
-        cookie_params = dict(extract_dataclass_items(self.config, exclude_none=True, include=Cookie.__dict__.keys()))
-
-        if scope_session is Empty:
-            await self.delete(session_id, store=store)
-            headers.add(
-                "Set-Cookie",
-                Cookie(value="null", key=self.config.key, expires=0, **cookie_params).to_header(header=""),
-            )
-        else:
+        if scope_session and scope_session is not Empty:
+            session_id = self.get_session_id(connection)
             serialised_data = self.serialize_data(scope_session, scope)
             await self.set(session_id=session_id, data=serialised_data, store=store)
             headers.add(
-                "Set-Cookie", Cookie(value=session_id, key=self.config.key, **cookie_params).to_header(header="")
+                "Set-Cookie",
+                Cookie(value=session_id, key=self.config.key, **self._set_cookie_params).to_header(header=""),
+            )
+        elif incoming_session_id and incoming_session_id != "null":
+            await self.delete(incoming_session_id, store=store)
+            headers.add(
+                "Set-Cookie",
+                Cookie(value="null", key=self.config.key, expires=0, **self._clear_cookie_params).to_header(header=""),
             )
 
     async def load_from_connection(self, connection: ASGIConnection) -> dict[str, Any]:
@@ -157,7 +170,7 @@ class ServerSideSessionBackend(BaseSessionBackend["ServerSideSessionConfig"]):
         Returns:
             The current session data
         """
-        if session_id := connection.cookies.get(self.config.key):
+        if (session_id := connection.cookies.get(self.config.key)) and session_id != "null":
             store = self.config.get_store_from_app(connection.scope["app"])
             data = await self.get(session_id, store=store)
             if data is not None:
